@@ -107,6 +107,13 @@ canvas#sky.pointing { cursor: pointer; }
 .statgrid .track { height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
 .statgrid .track i { display: block; height: 100%; border-radius: 3px; }
 .statgrid .v { font-family: var(--f-mono); font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+.ask .row { gap: 6px; }
+.ask .chip[aria-pressed="true"] { background: rgba(159, 211, 255, 0.16); border-color: var(--focus); }
+.ask .chip[aria-pressed="false"] { opacity: 1; }
+.answer { display: grid; gap: 8px; padding: 10px; border-radius: 8px; background: rgba(159, 211, 255, 0.06); margin-top: 8px; min-width: 0; }
+.answer p { margin: 0; }
+.answer h5 { margin: 4px 0 0; font: 600 13px var(--f-display); color: var(--ink); }
+.answer a { color: var(--focus); }
 .close { all: unset; cursor: pointer; font-size: 12px; color: var(--ink-3); justify-self: start; }
 .close:hover { color: var(--ink); }
 .close:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -426,7 +433,143 @@ syncSpin();
 
 function select(n) {
   state.selected = n || null;
+  state.q = null;
+  try { history.replaceState(null, "", n ? "#" + encodeURIComponent(n.id) : location.pathname + location.search); } catch (e) {}
   renderPanel();
+}
+
+/* ---------- fixed questions, answered from the graph itself (no model) ---------- */
+const linked = (n, type, out) => visibleEdges.filter(e => e.type === type && (out ? e.a === n : e.b === n)).map(e => ({ e, o: out ? e.b : e.a }));
+const summary = e => (e.note || "").split(" | ")[0];
+const extraNote = e => (e.note || "").split(" | ").slice(1).join(" | ");
+const nodeBtn = n => `<button class="to" type="button" data-id="${esc(n.id)}">${esc(n.label)}</button>`;
+const regionName = r => REGION[r] || r || "";
+const opaStatus = c => ((c.props || "").split("opa_key_status=")[1] || "").trim();
+function readLink(clause) {
+  const d = byId[standardOf[clause.id]];
+  return d && d.url ? `<a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.label)}</a>${d.licensed ? " (licensed; no public text)" : ""}` : "";
+}
+function answerList(items) { return items.length ? `<ul class="links">${items.join("")}</ul>` : `<p class="note">Nothing found with the current filters.</p>`; }
+function clauseItem(e) {
+  const r = readLink(e.b);
+  return `<li>${nodeBtn(e.b)}<div class="meta">${pill(e.status)}${e.region ? regionName(e.region) : ""}${e.strength ? " · strength: " + esc(e.strength) : ""}</div>` +
+         `<div class="note">${esc(summary(e))}</div>${r ? `<div class="note">Read: ${r}</div>` : ""}</li>`;
+}
+function linkItem(e, o) {
+  return `<li>${nodeBtn(o)}<div class="meta">${pill(e.status)}${e.strength ? "strength: " + esc(e.strength) : ""}</div>${e.note ? `<div class="note">${esc(e.note)}</div>` : ""}</li>`;
+}
+function classClauses(n, keep) {
+  let html = "", total = 0;
+  for (const { o: ctl } of linked(n, "MITIGATED_BY", true)) {
+    const items = linked(ctl, "SATISFIES", true).filter(({ e }) => keep(e)).map(({ e }) => clauseItem(e));
+    if (!items.length) continue;
+    total += items.length;
+    html += `<h5>${esc(ctl.label)}</h5>${answerList(items)}`;
+  }
+  return total ? `<p>${total} clause links across this threat's controls.</p>${html}` : `<p class="note">Nothing found with the current filters.</p>`;
+}
+function unique(arr) { return [...new Set(arr)]; }
+function classesFor(controls) { return unique(controls.flatMap(c => linked(c, "MITIGATED_BY", false).map(x => x.o))); }
+function verifiedCaGlobal(c) {
+  const all = edges.filter(e => e.type === "SATISFIES" && e.a === c && ["CA", "GLOBAL"].includes(e.region));
+  return { all, ok: all.filter(e => e.status === "VERIFIED") };
+}
+
+const QUESTIONS = {
+  ThreatClass: [
+    ["stops", "What stops this threat?", n => {
+      const items = linked(n, "MITIGATED_BY", true).map(({ e, o }) =>
+        `<li>${nodeBtn(o)}<div class="meta">${pill(e.status)}strength: ${esc(e.strength)}${opaStatus(o) ? " · OPA: " + esc(opaStatus(o)) : ""}</div><div class="note">${esc(e.note)}</div></li>`);
+      return `<p>${items.length} controls are mapped to ${esc(n.label.toLowerCase())}. These links are OSPREY's own design.</p>` + answerList(items);
+    }],
+    ["clauses", "Which regulation clauses apply?", n => classClauses(n, () => true)],
+    ["verified", "Which of those clauses are verified?", n => classClauses(n, e => e.status === "VERIFIED")],
+    ["canada", "What does Canada require?", n => classClauses(n, e => e.region === "CA")],
+    ["lists", "Which public threat lists name it?", n => answerList(linked(n, "ANCHORED_IN", true).map(({ e, o }) => linkItem(e, o)))],
+    ["gaps", "Which of its controls have no verified Canada or Global clause?", n => {
+      const gaps = linked(n, "MITIGATED_BY", true).map(x => x.o).filter(c => !verifiedCaGlobal(c).ok.length);
+      return `<p>${gaps.length} of its controls have no verified Canada or Global clause yet.</p>` +
+        answerList(gaps.map(c => { const v = verifiedCaGlobal(c); return `<li>${nodeBtn(c)}<div class="meta">${v.all.length ? v.all.length + " Canada or Global clause links, none verified" : "no Canada or Global clause mapped"}</div></li>`; }));
+    }],
+  ],
+  Control: [
+    ["threats", "Which threats does it stop?", n => answerList(linked(n, "MITIGATED_BY", false).map(({ e, o }) => linkItem(e, o)))],
+    ["clauses", "Which clauses does it satisfy?", n => answerList(linked(n, "SATISFIES", true).map(({ e }) => clauseItem(e)))],
+    ["verified", "Is it verified for Canada and Global?", n => {
+      const v = verifiedCaGlobal(n);
+      const head = v.all.length ? `<p>${v.ok.length} of its ${v.all.length} Canada and Global clause links are verified.</p>` : `<p>No Canada or Global clause is mapped to this control.</p>`;
+      return head + (v.all.length ? `<ul class="links">${v.all.map(clauseItem).join("")}</ul>` : "");
+    }],
+    ["read", "Where do I read the sources?", n => {
+      const byDoc = {};
+      for (const { e } of linked(n, "SATISFIES", true)) { const d = byId[standardOf[e.b.id]]; (byDoc[d ? d.id : "?"] ||= { d, items: [] }).items.push(e); }
+      return Object.values(byDoc).map(({ d, items }) =>
+        `<h5>${d && d.url ? `<a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.label)}</a>` : esc(d ? d.label : "Unknown source")}${d && d.licensed ? " (licensed)" : ""}</h5>` +
+        `<p class="note">${items.map(e => esc(e.clause) + " (" + STATUS[e.status].name.toLowerCase() + ")").join("; ")}</p>`).join("") || `<p class="note">Nothing found with the current filters.</p>`;
+    }],
+  ],
+  Requirement: [
+    ["asks", "What does this clause ask for?", n => {
+      const ins = linked(n, "SATISFIES", false);
+      if (!ins.length) return `<p class="note">Nothing found with the current filters.</p>`;
+      const e = ins[0].e, more = extraNote(e);
+      return `<p>${esc(summary(e))}</p><div class="meta">${pill(e.status)}${regionName(e.region)}</div>${more ? `<p class="note">${esc(more)}</p>` : ""}<p class="note">This is a short summary in our own words, not the clause text. Read the source for the exact wording.</p>`;
+    }],
+    ["controls", "Which controls rely on it?", n => answerList(linked(n, "SATISFIES", false).map(({ e, o }) => `<li>${nodeBtn(o)}<div class="meta">${pill(e.status)}strength: ${esc(e.strength)}</div></li>`))],
+    ["threats", "Which threats does it cover?", n => {
+      const cls = classesFor(linked(n, "SATISFIES", false).map(x => x.o));
+      return `<p>Through the controls that rely on it, this clause supports ${cls.length} threat classes.</p>` + answerList(cls.map(c => `<li>${nodeBtn(c)}</li>`));
+    }],
+    ["read", "Where do I read it?", n => {
+      const r = readLink(n), e = (linked(n, "SATISFIES", false)[0] || {}).e;
+      return r ? `<p>${r}${e ? `, at ${esc(e.clause)}` : ""}.</p>${e && e.status === "VERIFIED" ? `<p class="note">${esc(extraNote(e))}</p>` : ""}` : `<p class="note">No source link stored.</p>`;
+    }],
+  ],
+  Standard: [
+    ["clauses", "Which of its clauses are used?", n => answerList(linked(n, "PART_OF", false).map(({ o }) => {
+      const e = edges.find(x => x.type === "SATISFIES" && x.b === o);
+      return `<li>${nodeBtn(o)}<div class="meta">${e ? pill(e.status) : ""}</div>${e ? `<div class="note">${esc(summary(e))}</div>` : ""}</li>`;
+    }))],
+    ["controls", "Which controls depend on it?", n => {
+      const ctls = unique(linked(n, "PART_OF", false).flatMap(({ o }) => linked(o, "SATISFIES", false).map(x => x.o)));
+      return answerList(ctls.map(c => `<li>${nodeBtn(c)}</li>`));
+    }],
+    ["verified", "How much of it is verified?", n => {
+      const sat = linked(n, "PART_OF", false).flatMap(({ o }) => linked(o, "SATISFIES", false).map(x => x.e));
+      const ok = sat.filter(e => e.status === "VERIFIED").length;
+      return `<p>${ok} of the ${sat.length} clause links that use this source are verified.</p>${n.url ? `<p>Source: <a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.url)}</a>${n.licensed ? " (licensed)" : ""}</p>` : ""}`;
+    }],
+  ],
+  ThreatAnchor: [
+    ["names", "Which threat class does it name?", n => answerList(linked(n, "ANCHORED_IN", false).map(({ e, o }) => linkItem(e, o)))],
+    ["checked", "How was it checked?", n => answerList(linked(n, "ANCHORED_IN", false).map(({ e, o }) => `<li><div class="meta">${pill(e.status)}${esc(o.label)}</div><div class="note">${esc(e.note)}</div></li>`))],
+  ],
+  Overview: [
+    ["verified", "Which clauses are verified?", () => {
+      const v = visibleEdges.filter(e => e.type === "SATISFIES" && e.status === "VERIFIED");
+      return `<p>${v.length} clause links are verified.</p>` + answerList(v.map(e => clauseItem(e).replace("<li>", `<li><div class="meta">${esc(e.a.label)}</div>`)));
+    }],
+    ["gaps", "Which controls have no verified Canada or Global clause?", () => {
+      const ctls = nodes.filter(n => n.type === "Control").filter(c => !verifiedCaGlobal(c).ok.length);
+      return `<p>${ctls.length} of the ${nodes.filter(n => n.type === "Control").length} controls have none yet.</p>` + answerList(ctls.map(c => `<li>${nodeBtn(c)}<div class="meta">${esc(opaStatus(c))}</div></li>`));
+    }],
+    ["unchecked", "What is still unchecked?", () => {
+      const sat = visibleEdges.filter(e => e.type === "SATISFIES");
+      const by = {}; for (const e of sat) (by[e.status] ||= []).push(e);
+      return `<p>Of ${sat.length} clause links shown, ${(by.VERIFIED || []).length} are verified.</p>` +
+        Object.entries(by).filter(([k]) => k !== "VERIFIED").map(([k, es]) =>
+          `<h5>${STATUS[k].name}: ${es.length}</h5><p class="note">${esc(STATUS[k].help)} Regions: ${unique(es.map(e => regionName(e.region))).join(", ")}.</p>`).join("");
+    }],
+  ],
+};
+function askBlock(kindKey, n) {
+  const qs = QUESTIONS[kindKey] || [];
+  if (!qs.length) return "";
+  const active = qs.find(q => q[0] === state.q);
+  const scope = `<p class="note">Answered from the graph with the current filters (${state.region === "cagl" ? "Canada + Global" : "all regions"}${Object.values(state.status).every(Boolean) ? "" : ", some evidence types hidden"}). No AI model is used.</p>`;
+  return `<div class="sect ask"><h4>Ask the graph</h4><div class="row">` +
+    qs.map(([k, label]) => `<button class="chip" type="button" data-q="${k}" aria-pressed="${k === state.q}">${esc(label)}</button>`).join("") +
+    `</div>${active ? `<div class="answer" id="answer">${active[2](n)}${scope}</div>` : ""}</div>`;
 }
 
 /* ---------- panel ---------- */
@@ -437,7 +580,7 @@ function kind(type) { return `<span class="kind" style="color:${COLORS[type]}"><
 
 function renderPanel() {
   const n = state.selected;
-  if (!n) { $body.innerHTML = overview(); return; }
+  if (!n) { $body.innerHTML = overview(); scrollToAnswer(); return; }
   const groups = {};
   for (const e of visibleEdges) {
     if (e.a !== n && e.b !== n) continue;
@@ -449,6 +592,7 @@ function renderPanel() {
   if (n.props) html += `<div class="props">${esc(n.props.replace(/; /g, " · ").replace(/=/g, ": "))}</div>`;
   const doc = n.type === "Standard" ? n : n.type === "Requirement" ? byId[standardOf[n.id]] : null;
   if (doc && doc.url) html += `<div class="src">Where to read it: <a href="${esc(doc.url)}" target="_blank" rel="noopener">${esc(doc.label)}</a>${doc.licensed ? " (licensed; no public text)" : ""}</div>`;
+  html += askBlock(n.type, n);
   for (const [title, items] of Object.entries(groups)) {
     items.sort((p, q) => order[p.e.status] - order[q.e.status] || p.other.label.localeCompare(q.other.label));
     html += `<div class="sect"><h4>${esc(title)} · ${items.length}</h4><ul class="links">`;
@@ -465,8 +609,15 @@ function renderPanel() {
   html += `<button class="close" type="button" id="clear">Back to the overview</button>`;
   $body.innerHTML = html;
   $body.scrollTop = 0;
+  scrollToAnswer();
+}
+function scrollToAnswer() {
+  const a = document.getElementById("answer");
+  if (a && state.q) a.scrollIntoView({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
 }
 $body.addEventListener("click", ev => {
+  const q = ev.target.closest("button[data-q]");
+  if (q) { state.q = state.q === q.dataset.q ? null : q.dataset.q; renderPanel(); return; }
   const b = ev.target.closest("button.to");
   if (b) { select(byId[b.dataset.id]); return; }
   if (ev.target.id === "clear") select(null);
@@ -488,6 +639,7 @@ function overview() {
       <p><strong>Each link's colour shows how far it was checked.</strong> Bright green links were checked against the source document by an independent reviewer. The rest are labelled by where they came from.</p>
       <p>Drag to turn the map. Point at a node to see what it connects to, and click it for the details and where to read the source.</p>
     </div>
+    ${askBlock("Overview", null)}
     <div class="sect"><h4>Links shown, by evidence</h4><div class="statgrid">${rows}</div></div>
     <div class="sect"><h4>Start with a threat class</h4><div class="row">${classes}</div></div>
     <div class="how"><p>The pipeline uses the Canada and Global links only. The US, UK and EU links are drafted but not checked.</p></div>`;
@@ -531,8 +683,15 @@ search.addEventListener("change", () => {
   if (n) { if (!visibleNodes.has(n)) { setRegion("all"); for (const k in state.status) state.status[k] = true; chipsEl.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", "true")); refilter(); } select(n); }
 });
 
+/* A link can open the page on one node, for example #CTL-QUARANTINE. */
+function fromHash() {
+  let id = "";
+  try { id = decodeURIComponent(location.hash.slice(1)); } catch (e) {}
+  if (byId[id] && byId[id] !== state.selected) { if (!visibleNodes.has(byId[id])) setRegion("all"); state.selected = byId[id]; state.q = null; renderPanel(); }
+}
+window.addEventListener("hashchange", fromHash);
 window.addEventListener("resize", resize);
-resize(); refilter(); requestAnimationFrame(frame);
+resize(); refilter(); fromHash(); requestAnimationFrame(frame);
 </script>
 
 </body>
